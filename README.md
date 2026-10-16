@@ -1,79 +1,47 @@
 # CheckBattery
 
-Analyze macOS battery behaviour from system logs: **when the Mac was charging,
-how fast the battery drains while in use, how much of the time is spent asleep,
-and how the percentage evolves over days.**
+A simple tool to check your **MacBook battery** from macOS system logs: when it
+was charged, how fast the battery drains while in use, and how much of the time
+the Mac is asleep instead of being used.
 
-Two complementary tools:
-
-| Script | Source | Best for |
-|---|---|---|
-| `analyze_battery.py` | a `log show` **powerd** text dump | Last ~1–3 days, awake-vs-asleep drain rate |
-| `battery_history.py` | the **Powerlog SQLite** database | Weeks–months: charge sessions, use vs. sleep, per-day % |
-
-Both are dependency-free (Python 3 standard library only).
+Needs macOS and Python 3 (no extra packages).
 
 ---
 
-## Why two scripts?
+## Legend
 
-macOS stores power data in two places with very different retention:
+The reports use three states:
 
-| Source | Path | Typical retention |
-|---|---|---|
-| Unified log (`powerd`) | `log show --predicate 'subsystem == "com.apple.powerd"'` | **~1–3 days** (ring buffer) |
-| Powerlog database | `/var/db/powerlog/Library/BatteryLife/CurrentPowerlog.PLSQL` | **weeks–months** (rotates into `Archives/`) |
-| `pmset -g log` | `/var/log/powermanagement` | ~1 day on a busy machine |
+| Label | Meaning |
+|---|---|
+| `[AC]` + `[charging]` | Plugged in and charging |
+| `[AC]` + `[plugged, not charging]` | Plugged in but not charging (battery full or charge limit) |
+| `[BATTERY]` | Running on battery (unplugged) |
 
-So `log show` is great for a detailed recent picture, while the Powerlog
-database is the right source for weekly/monthly history.
+Both `[AC]` states mean the Mac is on wall power — this **includes any use while
+plugged in**. Only `[BATTERY]` time is used to calculate how fast the battery
+drains.
 
-> ⚠️ **`log show` trap:** if you request a time range that is *older than the
-> retention window*, `log show` does **not** error — it silently returns the
-> most recent data instead. Always verify the first/last timestamp before
-> trusting a dump:
-> ```bash
-> log show --last 90d --style compact --predicate 'subsystem == "com.apple.powerd"' | sed -n '2p'
-> ```
-> If that prints today's date, the older range no longer exists.
+Other terms in the output:
+
+- `asleep` / `awake` — how much of a `[BATTERY]` period the Mac was asleep vs awake
+- `rate while awake` — battery drain per hour while actually awake (e.g. `14.5 %/h`)
 
 ---
 
-## Requirements
+## `analyze_battery.py` — recent days (from `log show`)
 
-- macOS
-- Python 3.8+ (no third-party packages)
-- For `battery_history.py`: the Powerlog DB is normally world-readable, so no
-  `sudo` is needed — but see [Using on another Mac](#using-on-another-mac) for
-  permission and schema caveats.
-
----
-
-## Quick start
-
-### 1. Recent behaviour (unified log)
+Best for the last ~1–3 days. Shows every charger plug/unplug and the drain rate.
 
 ```bash
-# Collect a dump (add --info; powerd messages are info/default level)
+# 1. make a dump of the powerd log
 log show --predicate 'subsystem == "com.apple.powerd"' --info --last 24h > powerd.log
 
-# Analyze it
+# 2. analyze it
 python3 analyze_battery.py powerd.log
 ```
 
-### 2. Long-range history (Powerlog)
-
-```bash
-python3 battery_history.py            # all available data
-python3 battery_history.py --days 30  # last 30 days
-python3 battery_history.py --db /path/to/CurrentPowerlog.PLSQL
-```
-
----
-
-## Sample output
-
-`analyze_battery.py`:
+Example output:
 
 ```
 === Power-source changes (charger) ===
@@ -91,138 +59,34 @@ python3 battery_history.py --db /path/to/CurrentPowerlog.PLSQL
       rate while AWAKE: 13.47 %/h (full 100% ~ 7.4 h)
 ```
 
-`battery_history.py`:
+---
+
+## `battery_history.py` — long-range history (Powerlog database)
+
+Best for weeks/months. Reads the database directly, no dump needed.
+
+```bash
+python3 battery_history.py            # all available data
+python3 battery_history.py --days 30  # last 30 days
+```
+
+Example output:
 
 ```
 ===== 2026-10-15 =====
   Battery: min 26%  max 100%
   [BATTERY ] 02:52->11:00  100% -> 78%
       total 8h 7m | asleep 5h 46m | awake 2h 21m | rate while awake: 9.3 %/h
-  [CHARGING] 11:19->13:04  84% -> 100%  (1h 45m)
+  [AC     ] 11:19->13:04  84% -> 100%  (1h 45m)  [charging]
   [BATTERY ] 13:04->23:36  100% -> 30%
       total 10h 32m | asleep 3h 59m | awake 6h 32m | rate while awake: 10.7 %/h
+  [AC     ] 23:40->01:17  26% -> 86%  (1h 36m)  [charging]
   Sleep periods (15x):
      03:53->09:27    5h 33m  Clamshell Sleep
      16:55->19:02    2h 7m   Clamshell Sleep
      ...
 ```
 
----
-
-## How it works
-
-### `analyze_battery.py` — key log markers
-
-| Marker in the log | Meaning |
-|---|---|
-| `[BDC] Battery percentage last X now Y` | battery % change (~every 5 min) |
-| `Settings change for power source change to AC Power / Battery Power` | charger plugged / unplugged |
-| `handleChargingStateUpdate State:... VBUS:... UISOC:...` | charging state transition |
-| `Entering Sleep state ...` / `Wake from ...` | sleep / wake |
-
-It splits the timeline into segments by AC state, then computes:
-
-```
-drain rate (%/h)   = points dropped / hours awake
-full runtime (h)   ≈ 100 / drain rate
-```
-
-Sleep time is subtracted so the "rate while awake" reflects real usage, not
-idle/sleep.
-
-### `battery_history.py` — Powerlog tables
-
-| Table | Columns used |
-|---|---|
-| `PLBatteryAgent_EventBackward_BatteryUI` | `timestamp, Level, IsCharging` |
-| `PLBatteryAgent_EventBackward_Battery` | `ExternalConnected` (AC vs on battery) |
-| `PLSleepWakeAgent_EventForward_PowerState` | `State, SleepTriggers` |
-
-How segments are classified: the timeline is split by **AC power**
-(`ExternalConnected`). Both *charging* and *plugged-but-not-charging* (e.g.
-held at 100%) count as `[AC]`; only unplugged time counts as `[BATTERY]`.
-**Time spent using the Mac while plugged in is therefore kept separate and is
-NOT included in the drain-rate calculation** — that rate reflects on-battery
-use only. Blips shorter than 2 minutes at plug/unplug edges are merged to
-avoid noise.
-
-Sleep decoding (verified empirically against `log show`):
-
-- `State = 1` **and** a `SleepTriggers` text (`Idle Sleep`, `Clamshell Sleep`, …)
-  → sleep onset
-- `State = 0` → full wake (matches display-on events)
-
-For richer data, `PLBatteryAgent_EventBackward_Battery` also has
-`ExternalConnected`, `CycleCount`, `MaxCapacity`, `DesignCapacity`,
-`Temperature`, `Amperage`, etc.
-
----
-
-## Using on another Mac
-
-Yes — the scripts are portable and need **no code changes** to run on a
-different Mac. Copy the folder (or `git clone`) and go. Three things to keep
-in mind:
-
-1. **Python 3.** Recent macOS does not ship `python3`; running it triggers the
-   Xcode Command Line Tools installer. Either install the CLT
-   (`xcode-select --install`) or install Python via Homebrew. No third-party
-   packages are needed.
-2. **Powerlog permissions.** On some Macs `/var/db/powerlog` is not readable by
-   the terminal (SIP / Full Disk Access). `battery_history.py` first tries a
-   read-only open, then automatically copies the DB to a temp dir. If it still
-   fails, run it with `sudo`, or grant your terminal **Full Disk Access** in
-   *System Settings > Privacy & Security*. The error message tells you which.
-3. **Schema differences.** Table names can vary across macOS versions. The
-   script detects missing tables and lists the available battery/sleep tables
-   so you can adapt. Desktops (Mac mini/Studio/iMac) have no battery and
-   therefore no data.
-
-For `analyze_battery.py`, just produce the dump **on that Mac** (the `log show`
-command in Quick start) and pass the file in. Timestamps are parsed in the
-machine's local time.
-
----
-
-## Collecting long-term history
-
-Because retention is limited, snapshot the data yourself if you want a
-permanent record. Example daily job:
-
-```bash
-# Read-only backup of the Powerlog DB
-sqlite3 /var/db/powerlog/Library/BatteryLife/CurrentPowerlog.PLSQL \
-  ".backup '/path/to/snapshots/powerlog-$(date +%F).sqlite'"
-
-# Or append the percentage table to a CSV
-sqlite3 -csv /var/db/powerlog/Library/BatteryLife/CurrentPowerlog.PLSQL \
-  "SELECT datetime(timestamp,'unixepoch','localtime'), Level, IsCharging \
-   FROM PLBatteryAgent_EventBackward_BatteryUI WHERE timestamp>1000000000" \
-  >> battery_history.csv
-```
-
-Schedule it with `launchd` or `cron`, and within a month you'll have a full
-history.
-
----
-
-## Caveats
-
-- `powerd` logs do **not** measure energy (Joules) per app. These tools rank
-  *who keeps the system awake* (power assertions) and compute drain rates.
-  For per-app energy, use `sudo powermetrics --samplers tasks` or
-  `top -o power` / Activity Monitor's Energy tab.
-- Battery health (cycle count, max capacity) is **not** in `log show`. Read it
-  from the Powerlog DB or with:
-  ```bash
-  system_profiler SPPowerDataType | grep -E "Cycle Count|Condition|Maximum Capacity"
-  ```
-- Some powerd fields are logged as `<private>` (redacted) unless a logging
-  profile is installed.
-- Percentage samples are periodic (~5 min), not per-second.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+> Reads `/var/db/powerlog/Library/BatteryLife/CurrentPowerlog.PLSQL` directly.
+> Normally no `sudo` is needed; if you get a permission error, run it with
+> `sudo`. Use `--db <path>` to point at a copy of the database.
