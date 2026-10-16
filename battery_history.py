@@ -26,6 +26,7 @@ Usage:
     python3 battery_history.py --db /path/to/CurrentPowerlog.PLSQL
 """
 import argparse
+import bisect
 import os
 import shutil
 import sqlite3
@@ -107,11 +108,34 @@ def load(db, days):
             + "\nAvailable battery/sleep tables: "
             + (", ".join(avail) if avail else "(none)")
             + "\nThis macOS version may store battery data differently.")
-    # --- battery percentage and charging state ---
-    samples = [(r[0], r[1], int(r[2] or 0)) for r in cur.execute(
+    # --- battery percentage and charging state (the UI level timeline) ---
+    ui = [(r[0], r[1], int(r[2] or 0)) for r in cur.execute(
         "SELECT timestamp, Level, IsCharging "
         "FROM PLBatteryAgent_EventBackward_BatteryUI "
         "WHERE timestamp > 1000000000 ORDER BY timestamp")]
+
+    # --- AC presence from the richer table ---
+    # BatteryUI only has IsCharging, which is 0 both when unplugged AND when
+    # plugged-but-full. The Battery table's ExternalConnected distinguishes
+    # "on AC power" from "on battery", so we classify with it when available.
+    ext = []
+    if "PLBatteryAgent_EventBackward_Battery" in _tables(con):
+        ext = [(r[0], int(r[1] or 0)) for r in cur.execute(
+            "SELECT timestamp, ExternalConnected "
+            "FROM PLBatteryAgent_EventBackward_Battery "
+            "WHERE timestamp > 1000000000 ORDER BY timestamp")]
+    ext_times = [e[0] for e in ext]
+
+    def on_ac(t, charging):
+        """On AC power at t? Use the most recent ExternalConnected sample
+        (within 15 min); fall back to the charging flag otherwise."""
+        if ext_times:
+            i = bisect.bisect_right(ext_times, t) - 1
+            if i >= 0 and (t - ext_times[i]) <= 900:
+                return ext[i][1]
+        return 1 if charging else 0        # fallback: charging implies AC
+
+    samples = [(t, lvl, chg, on_ac(t, chg)) for t, lvl, chg in ui]
 
     # --- sleep / wake intervals ---
     sleeps = []                       # list of (start, end, reason)
@@ -170,21 +194,33 @@ def main():
           f"({len(samples)} samples, {len(sleeps)} sleep periods)")
     print()
 
-    # --- build segments from charging-state changes ---
-    segs = []
-    t0, l0, c0 = samples[0]
-    prev = samples[0]
-    for t, lvl, chg in samples[1:]:
-        if chg != c0:
-            segs.append((c0, t0, l0, prev[0], prev[1]))
-            t0, l0, c0 = t, lvl, chg
-        prev = (t, lvl, chg)
-    segs.append((c0, t0, l0, prev[0], prev[1]))
+    # --- build segments from AC-power changes (plugged vs on battery) ---
+    # Loading while charging is therefore kept SEPARATE from battery use.
+    segs = []            # [on_ac, t_start, lvl_start, t_end, lvl_end, {chg}]
+    for t, lvl, chg, ac in samples:
+        if segs and segs[-1][0] == ac:
+            s = segs[-1]
+            s[3], s[4] = t, lvl
+            s[5].add(chg)
+        else:
+            segs.append([ac, t, lvl, t, lvl, {chg}])
+
+    # Merge AC/battery blips shorter than MIN_SEG (noise at plug/unplug edges)
+    MIN_SEG = 120
+    merged = []
+    for s in segs:
+        if merged and (s[3] - s[1]) < MIN_SEG:
+            prev = merged[-1]
+            prev[3], prev[4] = s[3], s[4]
+            prev[5] |= s[5]
+        else:
+            merged.append(s)
+    segs = merged
 
     # --- group by day (by segment start) ---
     by_day = {}
-    for st, a, la, b, lb in segs:
-        by_day.setdefault(ts(a).date(), []).append((st, a, la, b, lb))
+    for s in segs:
+        by_day.setdefault(ts(s[1]).date(), []).append(s)
 
     for day in sorted(by_day):
         print(f"===== {day} =====")
@@ -192,11 +228,14 @@ def main():
         if levels:
             print(f"  Battery: min {min(levels):.0f}%  max {max(levels):.0f}%")
 
-        for st, a, la, b, lb in by_day[day]:
+        for ac, a, la, b, lb, chgs in by_day[day]:
             dur = b - a
-            if st == 1:
-                print(f"  [CHARGING] {ts(a):%H:%M}->{ts(b):%H:%M}  "
-                      f"{la:.0f}% -> {lb:.0f}%  ({hm(dur)})")
+            if ac == 1:
+                note = ("charging" if chgs == {1}
+                        else "plugged, not charging" if chgs == {0}
+                        else "charging/plugged")
+                print(f"  [AC     ] {ts(a):%H:%M}->{ts(b):%H:%M}  "
+                      f"{la:.0f}% -> {lb:.0f}%  ({hm(dur)})  [{note}]")
             else:
                 slp = asleep_seconds(a, b, sleeps)
                 awake = max(dur - slp, 1)

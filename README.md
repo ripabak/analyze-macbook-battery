@@ -135,7 +135,16 @@ idle/sleep.
 | Table | Columns used |
 |---|---|
 | `PLBatteryAgent_EventBackward_BatteryUI` | `timestamp, Level, IsCharging` |
+| `PLBatteryAgent_EventBackward_Battery` | `ExternalConnected` (AC vs on battery) |
 | `PLSleepWakeAgent_EventForward_PowerState` | `State, SleepTriggers` |
+
+How segments are classified: the timeline is split by **AC power**
+(`ExternalConnected`). Both *charging* and *plugged-but-not-charging* (e.g.
+held at 100%) count as `[AC]`; only unplugged time counts as `[BATTERY]`.
+**Time spent using the Mac while plugged in is therefore kept separate and is
+NOT included in the drain-rate calculation** — that rate reflects on-battery
+use only. Blips shorter than 2 minutes at plug/unplug edges are merged to
+avoid noise.
 
 Sleep decoding (verified empirically against `log show`):
 
