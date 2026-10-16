@@ -26,10 +26,61 @@ Usage:
     python3 battery_history.py --db /path/to/CurrentPowerlog.PLSQL
 """
 import argparse
+import os
+import shutil
 import sqlite3
+import tempfile
 from datetime import datetime
 
 DEFAULT_DB = "/var/db/powerlog/Library/BatteryLife/CurrentPowerlog.PLSQL"
+
+REQUIRED_TABLES = (
+    "PLBatteryAgent_EventBackward_BatteryUI",
+    "PLSleepWakeAgent_EventForward_PowerState",
+)
+
+
+class PowerlogError(RuntimeError):
+    """Raised with a human-friendly message when the DB cannot be read."""
+
+
+def _tables(con):
+    return {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def open_db(path):
+    """Open the Powerlog DB, working around permissions and WAL locking.
+
+    Tries a direct read-only open first; if that fails (e.g. the file or its
+    -wal/-shm sidecars are not readable), it copies the DB to a temp dir and
+    opens the copy. Raises PowerlogError with guidance if neither works.
+    """
+    if not os.path.exists(path):
+        raise PowerlogError(f"file not found: {path}")
+
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        _tables(con)                       # force an actual open
+        return con
+    except sqlite3.Error:
+        pass
+
+    tmpdir = tempfile.mkdtemp(prefix="powerlog-")
+    base = os.path.basename(path)
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            src = path + suffix
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(tmpdir, base + suffix))
+        con = sqlite3.connect(os.path.join(tmpdir, base))
+        _tables(con)
+        return con
+    except (OSError, sqlite3.Error) as err:
+        raise PowerlogError(
+            f"could not read {path} ({err}).\n"
+            f"Try running with sudo, or grant your terminal Full Disk Access "
+            f"in System Settings > Privacy & Security.")
 
 
 def ts(epoch):
@@ -44,9 +95,18 @@ def hm(seconds):
 
 def load(db, days):
     """Read battery samples and sleep intervals from the Powerlog database."""
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con = open_db(db)
     cur = con.cursor()
 
+    missing = [t for t in REQUIRED_TABLES if t not in _tables(con)]
+    if missing:
+        avail = sorted(t for t in _tables(con)
+                       if "Battery" in t or "Sleep" in t)
+        raise PowerlogError(
+            "expected table(s) missing: " + ", ".join(missing)
+            + "\nAvailable battery/sleep tables: "
+            + (", ".join(avail) if avail else "(none)")
+            + "\nThis macOS version may store battery data differently.")
     # --- battery percentage and charging state ---
     samples = [(r[0], r[1], int(r[2] or 0)) for r in cur.execute(
         "SELECT timestamp, Level, IsCharging "
@@ -96,8 +156,8 @@ def main():
 
     try:
         samples, sleeps = load(args.db, args.days)
-    except sqlite3.Error as err:
-        print(f"Could not read the Powerlog database: {err}")
+    except PowerlogError as err:
+        print(f"Could not read the Powerlog database:\n  {err}")
         print(f"Path tried: {args.db}")
         return
 

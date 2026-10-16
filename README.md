@@ -43,8 +43,9 @@ database is the right source for weekly/monthly history.
 
 - macOS
 - Python 3.8+ (no third-party packages)
-- For `battery_history.py`: the Powerlog DB is world-readable, so **no sudo**
-  is needed to read it.
+- For `battery_history.py`: the Powerlog DB is normally world-readable, so no
+  `sudo` is needed — but see [Using on another Mac](#using-on-another-mac) for
+  permission and schema caveats.
 
 ---
 
@@ -145,6 +146,32 @@ Sleep decoding (verified empirically against `log show`):
 For richer data, `PLBatteryAgent_EventBackward_Battery` also has
 `ExternalConnected`, `CycleCount`, `MaxCapacity`, `DesignCapacity`,
 `Temperature`, `Amperage`, etc.
+
+---
+
+## Using on another Mac
+
+Yes — the scripts are portable and need **no code changes** to run on a
+different Mac. Copy the folder (or `git clone`) and go. Three things to keep
+in mind:
+
+1. **Python 3.** Recent macOS does not ship `python3`; running it triggers the
+   Xcode Command Line Tools installer. Either install the CLT
+   (`xcode-select --install`) or install Python via Homebrew. No third-party
+   packages are needed.
+2. **Powerlog permissions.** On some Macs `/var/db/powerlog` is not readable by
+   the terminal (SIP / Full Disk Access). `battery_history.py` first tries a
+   read-only open, then automatically copies the DB to a temp dir. If it still
+   fails, run it with `sudo`, or grant your terminal **Full Disk Access** in
+   *System Settings > Privacy & Security*. The error message tells you which.
+3. **Schema differences.** Table names can vary across macOS versions. The
+   script detects missing tables and lists the available battery/sleep tables
+   so you can adapt. Desktops (Mac mini/Studio/iMac) have no battery and
+   therefore no data.
+
+For `analyze_battery.py`, just produce the dump **on that Mac** (the `log show`
+command in Quick start) and pass the file in. Timestamps are parsed in the
+machine's local time.
 
 ---
 
