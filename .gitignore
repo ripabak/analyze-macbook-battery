@@ -1,0 +1,22 @@
+# Raw / machine-specific data (do not commit)
+*.log
+powerd*.txt
+riwayat_sore.txt
+*.PLSQL
+*.PLSQL-shm
+*.PLSQL-wal
+*.sqlite
+*.sqlite3
+powerlog-*.sqlite
+battery_history.csv
+snapshots/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Pi harness
+.pi/
